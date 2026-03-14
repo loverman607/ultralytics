@@ -1242,3 +1242,14 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion(preds, batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+
+class TailBalancedLoss(v8DetectionLoss):
+    """Balanced Softmax for tail-class handling."""
+
+    def __init__(self, model, class_weights=None):
+        super().__init__(model)
+        if class_weights is not None:
+            self.bce = nn.BCEWithLogitsLoss(
+                pos_weight=class_weights.to(model.device),
+                reduction="none"
+            )

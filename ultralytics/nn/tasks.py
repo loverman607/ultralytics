@@ -72,6 +72,7 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    CBAM,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, WINDOWS, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -512,6 +513,24 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
+class LTDetectionModel(DetectionModel):
+    """YOLO26 detection model with Tail-Aware CBAM attention."""
+
+    def __init__(self, cfg="yolo26n.yaml", ch=3, nc=None, verbose=True):
+        super().__init__(cfg, ch, nc, verbose)
+        # Insert Tail-Aware Attention
+        # NOTE: adjust 'channels' to match backbone output
+        backbone_out_channels = 256
+        self.cbam = CBAM(channels=backbone_out_channels)
+
+    def forward(self, x, augment=False, visualize=False):
+        # Forward through backbone
+        backbone_feats = self.model[:-1](x)
+        # Apply Tail-Aware Attention
+        att_feats = self.cbam(backbone_feats)
+        # Forward through head (Detect module)
+        return self.model[-1](att_feats)
 
 
 class OBBModel(DetectionModel):

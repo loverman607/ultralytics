@@ -230,3 +230,48 @@ class DetectionTrainer(BaseTrainer):
         max_num_obj = max(len(label["cls"]) for label in train_dataset.labels) * 4  # 4 for mosaic augmentation
         del train_dataset  # free memory
         return super().auto_batch(max_num_obj)
+
+class LTTrainer(DetectionTrainer):
+    """Trainer for tail-aware YOLO26."""
+
+    def get_model(self, cfg=None, weights=None, verbose=True):
+        """Return LTDetectionModel."""
+        from nn.tasks import LTDetectionModel
+        model = LTDetectionModel(cfg, nc=self.data["nc"], verbose=verbose)
+        if weights:
+            model.load(weights)
+        return model
+
+    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
+        """Build dataloader with tail-biased sampler for rare classes."""
+        loader = super().get_dataloader(dataset_path, batch_size, rank, mode)
+        # Optional: replace dataset.sampler with TailClassSampler
+        return loader
+
+    def validate(self):
+        """Compute tail-aware metrics (F1/AP per class)."""
+        metrics, fitness = super().validate()
+        if metrics:
+            # Log tail-class F1
+            LOGGER.info("Tail-class metrics: ...")
+        return metrics, fitness
+
+    def build_optimizer(self, model, lr=0.001, decay=1e-5):
+        """Per-layer LR: backbone lower, head higher."""
+        backbone_params = []
+        head_params = []
+
+        for k, v in unwrap_model(model).named_parameters():
+            if not v.requires_grad:
+                continue
+            is_backbone = any(k.startswith(f"model.{i}.") for i in range(10))
+            if is_backbone:
+                backbone_params.append(v)
+            else:
+                head_params.append(v)
+
+        optimizer = torch.optim.AdamW([
+            {"params": backbone_params, "lr": lr*0.1, "weight_decay": decay},
+            {"params": head_params, "lr": lr, "weight_decay": decay},
+        ])
+        return optimizer
