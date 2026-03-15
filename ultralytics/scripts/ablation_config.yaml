@@ -1,0 +1,21 @@
+baseline: C:\Users\ifeol\Documents\MACO\yoloresearch\ultralytics\runs\detect\train4\weights\best.pt
+full: C:\Users\ifeol\Documents\MACO\yoloresearch\ultralytics\runs\detect\train\weights\best.pt
+data: C:\Users\ifeol\Documents\MACO\datasets\MACO\data.yaml
+split: test
+imgsz: 640
+conf: 0.25
+device: null
+project: runs/ablation
+name: lt_ablation
+plots: true
+ablations:
+  - name: no_dual_head
+    weights: C:\path\to\ablation_no_dual_head.pt
+  - name: no_cbam
+    weights: C:\path\to\ablation_no_cbam.pt
+  - name: no_tail_loss
+    weights: C:\path\to\ablation_no_tail_loss.pt
+  - name: no_tail_sampler
+    weights: C:\path\to\ablation_no_tail_sampler.pt
+  - name: no_logit_adjust
+    weights: C:\path\to\ablation_no_logit_adjust.pt

@@ -45,6 +45,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    DualDetect,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -79,6 +80,7 @@ from ultralytics.utils.checks import check_requirements, check_suffix, check_yam
 from ultralytics.utils.loss import (
     E2ELoss,
     PoseLoss26,
+    TailBalancedLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
@@ -289,7 +291,7 @@ class BaseModel(torch.nn.Module):
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
         if isinstance(
-            m, Detect
+            m, (Detect, DualDetect)
         ):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect, YOLOEDetect, YOLOESegment
             m.stride = fn(m.stride)
             m.anchors = fn(m.anchors)
@@ -518,19 +520,121 @@ class LTDetectionModel(DetectionModel):
     """YOLO26 detection model with Tail-Aware CBAM attention."""
 
     def __init__(self, cfg="yolo26n.yaml", ch=3, nc=None, verbose=True):
+        self.backbone_end = None
+        self.cbam = None
         super().__init__(cfg, ch, nc, verbose)
-        # Insert Tail-Aware Attention
-        # NOTE: adjust 'channels' to match backbone output
-        backbone_out_channels = 256
-        self.cbam = CBAM(channels=backbone_out_channels)
+        # Index of last backbone layer in parsed model list
+        self.backbone_end = self._infer_backbone_end()
 
-    def forward(self, x, augment=False, visualize=False):
-        # Forward through backbone
-        backbone_feats = self.model[:-1](x)
-        # Apply Tail-Aware Attention
-        att_feats = self.cbam(backbone_feats)
-        # Forward through head (Detect module)
-        return self.model[-1](att_feats)
+    def _infer_backbone_end(self):
+        """Infer last backbone index from model YAML or module list."""
+        if hasattr(self, "yaml") and isinstance(self.yaml, dict) and "backbone" in self.yaml:
+            return len(self.yaml.get("backbone", [])) - 1
+        # Fallback: assume head starts at first Detect-like module
+        for i, m in enumerate(self.model):
+            if isinstance(
+                m,
+                (
+                    Detect,
+                    DualDetect,
+                    Segment,
+                    Segment26,
+                    Pose,
+                    Pose26,
+                    OBB,
+                    OBB26,
+                    WorldDetect,
+                    YOLOEDetect,
+                    YOLOESegment,
+                    YOLOESegment26,
+                    v10Detect,
+                ),
+            ):
+                return i - 1
+        return len(self.model) - 1
+
+    def set_dual_head(self, head_idx: list[int], tail_idx: list[int]) -> bool:
+        """Replace Detect head with DualDetect for head/tail class branches."""
+        from ultralytics.nn.modules.head import DualDetect
+
+        head_idx = sorted(set(int(x) for x in head_idx))
+        tail_idx = sorted(set(int(x) for x in tail_idx))
+        if not head_idx or not tail_idx:
+            LOGGER.warning("Dual head requires non-empty head and tail class lists; skipping.")
+            return False
+        m = self.model[-1]
+        if isinstance(m, DualDetect):
+            return True
+        if not isinstance(m, Detect):
+            LOGGER.warning("Last module is not Detect; skipping dual head conversion.")
+            return False
+        self.model[-1] = DualDetect(m, head_idx, tail_idx)
+        return True
+
+    def _init_cbam(self, feats):
+        """Initialize CBAM once we know feature channels."""
+        if isinstance(feats, (list, tuple)):
+            cbams = []
+            for f in feats:
+                if isinstance(f, torch.Tensor):
+                    cbams.append(CBAM(f.shape[1]))
+                else:
+                    cbams.append(nn.Identity())
+            self.cbam = nn.ModuleList(cbams)
+            device = feats[0].device if len(feats) else next(self.parameters()).device
+        elif isinstance(feats, torch.Tensor):
+            self.cbam = CBAM(feats.shape[1])
+            device = feats.device
+        else:
+            self.cbam = nn.Identity()
+            device = next(self.parameters()).device
+        self.cbam.to(device)
+        initialize_weights(self.cbam)
+
+    def _apply_cbam(self, feats):
+        """Apply CBAM to backbone output."""
+        if self.cbam is None:
+            self._init_cbam(feats)
+        if isinstance(feats, (list, tuple)):
+            if not isinstance(self.cbam, nn.ModuleList) or len(self.cbam) != len(feats):
+                self._init_cbam(feats)
+            out = []
+            for f, m in zip(feats, self.cbam):
+                out.append(m(f) if isinstance(f, torch.Tensor) else f)
+            return type(feats)(out)
+        if isinstance(feats, torch.Tensor):
+            if isinstance(self.cbam, nn.ModuleList):
+                self._init_cbam(feats)
+            return self.cbam(feats)
+        return feats
+
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """Forward pass with CBAM inserted after the backbone."""
+        y, dt, embeddings = [], [], []
+        embed = frozenset(embed) if embed is not None else {-1}
+        max_idx = max(embed)
+        if self.backbone_end is None:
+            self.backbone_end = self._infer_backbone_end()
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x)
+            if m.i == self.backbone_end:
+                x = self._apply_cbam(x)
+            y.append(x if m.i in self.save else None)
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if m.i in embed:
+                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))
+                if m.i == max_idx:
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        return x
+
+    def init_criterion(self):
+        """Initialize tail-balanced loss criterion."""
+        return E2ELoss(self, TailBalancedLoss) if getattr(self, "end2end", False) else TailBalancedLoss(self)
 
 
 class OBBModel(DetectionModel):

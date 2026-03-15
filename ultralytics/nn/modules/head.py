@@ -20,7 +20,18 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = (
+    "OBB",
+    "Classify",
+    "Detect",
+    "DualDetect",
+    "Pose",
+    "RTDETRDecoder",
+    "Segment",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+)
 
 
 class Detect(nn.Module):
@@ -250,6 +261,171 @@ class Detect(nn.Module):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
 
+
+class DualDetect(nn.Module):
+    """Dual-branch Detect head with separate classification branches for head and tail classes."""
+
+    dynamic = False
+    export = False
+    format = None
+    max_det = 300
+    agnostic_nms = False
+    shape = None
+    anchors = torch.empty(0)
+    strides = torch.empty(0)
+    legacy = False
+    xyxy = False
+
+    def __init__(self, detect: Detect, head_idx: list[int], tail_idx: list[int]):
+        super().__init__()
+        if not isinstance(detect, Detect):
+            raise TypeError("DualDetect expects a Detect module.")
+        if len(head_idx) == 0 or len(tail_idx) == 0:
+            raise ValueError("DualDetect requires non-empty head and tail class lists.")
+
+        self.nc = detect.nc
+        self.nl = detect.nl
+        self.reg_max = detect.reg_max
+        self.no = detect.no
+        self.stride = detect.stride
+        self.legacy = detect.legacy
+        self.max_det = detect.max_det
+        self.agnostic_nms = detect.agnostic_nms
+        self.xyxy = detect.xyxy
+        self.dynamic = detect.dynamic
+        self.export = detect.export
+        self.format = detect.format
+        self.shape = getattr(detect, "shape", None)
+        self.anchors = detect.anchors
+        self.strides = detect.strides
+        self._end2end = getattr(detect, "_end2end", True)
+
+        device = next(detect.parameters()).device
+        self.register_buffer("head_idx", torch.tensor(head_idx, dtype=torch.long, device=device))
+        self.register_buffer("tail_idx", torch.tensor(tail_idx, dtype=torch.long, device=device))
+        self.nc_head = len(head_idx)
+        self.nc_tail = len(tail_idx)
+
+        # Shared regression head and DFL
+        self.cv2 = detect.cv2
+        self.dfl = detect.dfl
+
+        # Separate classification heads
+        self.cv3_head = self._make_cls_head(detect.cv3, head_idx)
+        self.cv3_tail = self._make_cls_head(detect.cv3, tail_idx)
+
+        # End2end one2one heads if present
+        if getattr(detect, "end2end", False):
+            self.one2one_cv2 = detect.one2one_cv2
+            self.one2one_cv3_head = self._make_cls_head(detect.one2one_cv3, head_idx)
+            self.one2one_cv3_tail = self._make_cls_head(detect.one2one_cv3, tail_idx)
+
+        # Ensure module attributes expected by parse_model/_predict_once exist
+        self.np = sum(x.numel() for x in self.parameters())
+        # Preserve graph indices from the original Detect module
+        self.i = getattr(detect, "i", getattr(self, "i", -1))
+        self.f = getattr(detect, "f", getattr(self, "f", -1))
+        self.type = getattr(self, "type", self.__class__.__name__)
+
+    @property
+    def end2end(self):
+        return getattr(self, "_end2end", True) and hasattr(self, "one2one_cv2")
+
+    @end2end.setter
+    def end2end(self, value):
+        self._end2end = value
+
+    def _make_cls_head(self, template: nn.ModuleList, idx: list[int]) -> nn.ModuleList:
+        cls_head = copy.deepcopy(template)
+        for i, m in enumerate(cls_head):
+            last = m[-1]
+            if not isinstance(last, nn.Conv2d):
+                raise TypeError("Expected Conv2d as last layer in classification head.")
+            new = nn.Conv2d(
+                last.in_channels,
+                len(idx),
+                1,
+                device=last.weight.device,
+                dtype=last.weight.dtype,
+            )
+            if last.weight.shape[0] >= len(idx):
+                new.weight.data.copy_(last.weight.data[idx])
+                if last.bias is not None and new.bias is not None:
+                    new.bias.data.copy_(last.bias.data[idx])
+            m[-1] = new
+        return cls_head
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: nn.ModuleList,
+        cls_head_head: nn.ModuleList,
+        cls_head_tail: nn.ModuleList,
+    ) -> dict[str, torch.Tensor]:
+        if box_head is None or cls_head_head is None or cls_head_tail is None:
+            return dict()
+        bs = x[0].shape[0]
+        boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        scores_head = torch.cat([cls_head_head[i](x[i]).view(bs, self.nc_head, -1) for i in range(self.nl)], dim=-1)
+        scores_tail = torch.cat([cls_head_tail[i](x[i]).view(bs, self.nc_tail, -1) for i in range(self.nl)], dim=-1)
+
+        scores = torch.zeros(bs, self.nc, scores_head.shape[-1], device=scores_head.device, dtype=scores_head.dtype)
+        scores.index_copy_(1, self.head_idx, scores_head)
+        scores.index_copy_(1, self.tail_idx, scores_tail)
+        return dict(boxes=boxes, scores=scores, feats=x)
+
+    def forward(self, x: list[torch.Tensor]):
+        preds = self.forward_head(x, self.cv2, self.cv3_head, self.cv3_tail)
+        if self.end2end:
+            x_detach = [xi.detach() for xi in x]
+            one2one = self.forward_head(x_detach, self.one2one_cv2, self.one2one_cv3_head, self.one2one_cv3_tail)
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        dbox = self._get_decode_boxes(x)
+        return torch.cat((dbox, x["scores"].sigmoid()), 1)
+
+    def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        shape = x["feats"][0].shape
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
+            self.shape = shape
+        dbox = self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0)) * self.strides
+        return dbox
+
+    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
+        return dist2bbox(
+            bboxes,
+            anchors,
+            xywh=xywh and not self.end2end and not self.xyxy,
+            dim=1,
+        )
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        boxes, scores = preds.split([4, self.nc], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        return torch.cat([boxes, scores, conf], dim=-1)
+
+    def get_topk_index(self, scores: torch.Tensor, max_det: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, anchors, nc = scores.shape
+        k = max_det if self.export else min(max_det, anchors)
+        if self.agnostic_nms:
+            scores, labels = scores.max(dim=-1, keepdim=True)
+            scores, indices = scores.topk(k, dim=1)
+            labels = labels.gather(1, indices)
+            return scores, labels, indices
+        ori_index = scores.max(dim=-1)[0].topk(k)[1].unsqueeze(-1)
+        scores = scores.gather(dim=1, index=ori_index.repeat(1, 1, nc))
+        scores, index = scores.flatten(1).topk(k)
+        idx = ori_index[torch.arange(batch_size)[..., None], index // nc]
+        return scores[..., None], (index % nc)[..., None].float(), idx
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models.

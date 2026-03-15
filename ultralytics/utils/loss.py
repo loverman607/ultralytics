@@ -1243,13 +1243,53 @@ class TVPSegmentLoss(TVPDetectLoss):
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
 
-class TailBalancedLoss(v8DetectionLoss):
-    """Balanced Softmax for tail-class handling."""
+class AdjustedBCEWithLogitsLoss(nn.Module):
+    """BCEWithLogitsLoss with optional logit adjustment for long-tailed classes."""
 
-    def __init__(self, model, class_weights=None):
-        super().__init__(model)
-        if class_weights is not None:
-            self.bce = nn.BCEWithLogitsLoss(
-                pos_weight=class_weights.to(model.device),
-                reduction="none"
-            )
+    def __init__(self, pos_weight: torch.Tensor | None = None, logit_adjustment: torch.Tensor | None = None):
+        super().__init__()
+        if pos_weight is not None:
+            self.register_buffer("pos_weight", pos_weight)
+        else:
+            self.pos_weight = None
+        if logit_adjustment is not None:
+            self.register_buffer("logit_adjustment", logit_adjustment)
+        else:
+            self.logit_adjustment = None
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.logit_adjustment is not None:
+            pred = pred + self.logit_adjustment.view(1, 1, -1)
+        return F.binary_cross_entropy_with_logits(pred, target, pos_weight=self.pos_weight, reduction="none")
+
+class TailBalancedLoss(v8DetectionLoss):
+    """Tail-balanced loss with optional logit adjustment for long-tailed classes."""
+
+    def __init__(
+        self,
+        model,
+        tal_topk: int = 10,
+        tal_topk2: int | None = None,
+        class_weights: torch.Tensor | None = None,
+        class_counts: torch.Tensor | None = None,
+        logit_adjustment_tau: float = 1.0,
+        eps: float = 1e-9,
+    ):
+        # Initialize base detection loss then adjust BCE for class imbalance
+        super().__init__(model, tal_topk, tal_topk2)
+        device = next(model.parameters()).device
+
+        if class_weights is None:
+            class_weights = getattr(model, "class_weights", None)
+        if class_counts is None:
+            class_counts = getattr(model, "class_counts", None)
+
+        self.pos_weight = class_weights.to(device) if class_weights is not None else None
+
+        self.logit_adjustment = None
+        if class_counts is not None:
+            counts = class_counts.to(device=device, dtype=torch.float32)
+            prior = counts / counts.sum().clamp(min=eps)
+            self.logit_adjustment = torch.log(prior.clamp(min=eps)) * float(logit_adjustment_tau)
+
+        self.bce = AdjustedBCEWithLogitsLoss(self.pos_weight, self.logit_adjustment)
